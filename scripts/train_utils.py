@@ -6,124 +6,73 @@ from torch.utils.data import DataLoader, random_split
 from tqdm import tqdm
 import os
 
-def load_transforms():
-    """
-    Load the data transformations
-    """
-    return transforms.Compose([
-        transforms.Resize((32, 32)),
-        transforms.ToTensor(),
-        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
-    ])
+def load_transforms(train=True):
+    mean, std = (0.5071,0.4865,0.4409), (0.2673,0.2564,0.2762)  # CIFAR-100; CIFAR-10 也可用 (0.4914,0.4822,0.4465)/(0.2023,0.1994,0.2010)
+    if train:
+        tf = transforms.Compose([
+            transforms.RandomCrop(32, padding=4),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize(mean, std),
+        ])
+    else:
+        tf = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(mean, std),
+        ])
+    return tf
 
-def load_data(data_dir, batch_size):
-    """
-    Load the data from the data directory and split it into training and validation sets
-    This function is similar to the cell 2. Data Preparation in 04_model_training.ipynb
+def load_data(train_dir, batch_size, val_ratio=0.1, num_workers=4):
+    full = datasets.ImageFolder(root=train_dir, transform=load_transforms(train=True))
+    n_total = len(full); n_val = max(1, int(n_total * val_ratio))
+    n_train = n_total - n_val
+    train_set, val_set = random_split(full, [n_train, n_val], generator=torch.Generator().manual_seed(123))
+    # 验证集不做随机增广
+    val_set.dataset.transform = load_transforms(train=False)
 
-    Args:
-        data_dir: The directory to load the data from
-        batch_size: The batch size to use for the data loaders
-    Returns:
-        train_loader: The training data loader
-        val_loader: The validation data loader
-    """
-    # Define data transformations: resize, convert to tensor, and normalize
-    data_transforms = load_transforms()
-
-    # Load the full dataset from the augmented data directory
-    full_dataset = datasets.ImageFolder(root=data_dir, transform=data_transforms)
-
-    # Split the dataset into training and validation sets (80/20 split)
-    train_size = int(0.8 * len(full_dataset))
-    val_size = len(full_dataset) - train_size
-    train_dataset, val_dataset = random_split(
-        full_dataset, [train_size, val_size],
-        generator=torch.Generator()
-    )
-
-    # Create data loaders for training and validation
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=2)
-
-    # Print dataset summary
-    print(f"Dataset loaded from: {data_dir}")
-    print(f"Total images: {len(full_dataset)}")
-    print(f"Number of classes: {len(full_dataset.classes)}")
-    print(f"Class names: {full_dataset.classes}")
-    print(f"Training set size: {len(train_dataset)}")
-    print(f"Validation set size: {len(val_dataset)}")
-
+    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True)
+    val_loader   = DataLoader(val_set,   batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
     return train_loader, val_loader
 
 
-def define_loss_and_optimizer(model: nn.Module, lr: float, weight_decay: float):
-    """
-    Define the loss function and optimizer
-    This function is similar to the cell 3. Model Configuration in 04_model_training.ipynb
-    Args:
-        model: The model to train
-        lr: Learning rate
-        weight_decay: Weight decay
-    Returns:
-        criterion: The loss function
-        optimizer: The optimizer
-        scheduler: The scheduler
-    """
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=3, factor=0.5)
+# ---- 2) 优化器 + 调度器 ----
+class _CompatScheduler:
+    """Wrap schedulers that don't take a metric so they accept step(val_loss)."""
+    def __init__(self, sched): self.sched = sched
+    def step(self, *_args, **_kwargs): self.sched.step()
+    def state_dict(self): return self.sched.state_dict()
+    def load_state_dict(self, s): return self.sched.load_state_dict(s)
+
+def define_loss_and_optimizer(model, lr, weight_decay):
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)  # 小幅 smoothing 提升泛化
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay, betas=(0.9, 0.999))
+    # 余弦退火到 0（T_max 在 main.py 里看不到 epoch，这里约个上限；实际每轮 step 一次）
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=200)
+    scheduler = _CompatScheduler(scheduler)  # 兼容 main.py 的 scheduler.step(val_loss)
     return criterion, optimizer, scheduler
 
-
-def train_epoch(model, dataloader, criterion, optimizer, device):
-    """
-    Train the model for one epoch
-    Args:
-        model: The model to train
-        dataloader: DataLoader for training data
-        criterion: Loss function
-        optimizer: Optimizer
-        device: Device to train on
-    Returns:
-        Average loss and accuracy for the epoch
-    """
+# ---- 3) 训练/验证（含 AMP + 梯度裁剪）----
+def train_epoch(model, loader, criterion, optimizer, device, max_norm=1.0):
     model.train()
-    running_loss = 0.0
-    correct = 0
-    total = 0
+    scaler = torch.cuda.amp.GradScaler(enabled=(device=='cuda' and torch.cuda.is_available()))
+    total_loss, correct, n = 0.0, 0, 0
+    for inputs, targets in loader:
+        inputs, targets = inputs.to(device), targets.to(device)
+        optimizer.zero_grad(set_to_none=True)
+        with torch.cuda.amp.autocast(enabled=scaler.is_enabled()):
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
+        scaler.scale(loss).backward()
+        if max_norm is not None:
+            scaler.unscale_(optimizer)
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm)
+        scaler.step(optimizer); scaler.update()
 
-    progress_bar = tqdm(dataloader, desc="Training", leave=False)
-
-    for inputs, labels in progress_bar:
-        inputs, labels = inputs.to(device), labels.to(device)
-
-        # Zero the parameter gradients
-        optimizer.zero_grad()
-
-        # Forward pass
-        outputs = model(inputs)
-        loss = criterion(outputs, labels)
-
-        # Backward pass and optimize
-        loss.backward()
-        optimizer.step()
-
-        # Statistics
-        running_loss += loss.item() * inputs.size(0)
-        _, predicted = outputs.max(1)
-        total += labels.size(0)
-        correct += predicted.eq(labels).sum().item()
-
-        # Update progress bar
-        progress_bar.set_postfix(
-            {"Loss": f"{loss.item():.4f}", "Acc": f"{100.0 * correct / total:.2f}%"}
-        )
-
-    epoch_loss = running_loss / total
-    epoch_acc = 100.0 * correct / total
-
-    return epoch_loss, epoch_acc
+        total_loss += loss.item() * inputs.size(0)
+        pred = outputs.argmax(1)
+        correct += (pred == targets).sum().item()
+        n += inputs.size(0)
+    return total_loss / n, 100.0 * correct / n
 
 
 def validate_epoch(model, dataloader, criterion, device):
