@@ -226,3 +226,9 @@ models/*
 # results
 results/*
 results_c100_*/*
+
+# slurm files
+*.slurm
+
+# slum log files
+slurm-*.out

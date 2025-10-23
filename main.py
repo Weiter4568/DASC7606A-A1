@@ -73,17 +73,17 @@ def parse_args():
     # Training parameters
     parser.add_argument("--batch_size", type=int, default=128,
                         help="Batch size for training")
-    parser.add_argument("--num_epochs", type=int, default=30,
+    parser.add_argument("--num_epochs", type=int, default=200,
                         help="Number of training epochs")
-    parser.add_argument("--lr", type=float, default=0.001,
+    parser.add_argument("--lr", type=float, default=0.01,
                         help="Learning rate")
-    parser.add_argument("--weight_decay", type=float, default=1e-4,
+    parser.add_argument("--weight_decay", type=float, default=5e-4,
                         help="Weight decay (L2 penalty)")
 
     # Checkpointing
     parser.add_argument("--save_freq", type=int, default=1,
                         help="Save checkpoint every N epochs")
-    parser.add_argument("--early_stopping_patience", type=int, default=10,
+    parser.add_argument("--early_stopping_patience", type=int, default=30,
                         help="Early stopping patience")
 
     # Hardware

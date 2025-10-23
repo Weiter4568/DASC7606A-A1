@@ -24,13 +24,19 @@ def load_transforms(train=True):
         ])
     return tf
 
-def load_data(train_dir, batch_size, val_ratio=0.1, num_workers=4):
-    full = datasets.ImageFolder(root=train_dir, transform=load_transforms(train=True))
-    n_total = len(full); n_val = max(1, int(n_total * val_ratio))
-    n_train = n_total - n_val
-    train_set, val_set = random_split(full, [n_train, n_val], generator=torch.Generator().manual_seed(123))
-    # 验证集不做随机增广
-    val_set.dataset.transform = load_transforms(train=False)
+def load_data(train_dir, batch_size, num_workers=8):
+    """
+    Load training and validation data separately.
+    train_dir: directory for training data (e.g., data_c100/augmented/train)
+    val_dir: directory for validation data (e.g., data_c100/raw/val, inferred automatically)
+    """
+    # Assume validation directory is "../raw/val" parallel to train_dir = ".../augmented/train"
+    # E.g., train_dir="data_c100/augmented/train" -> val_dir="data_c100/raw/val"
+    base_data_dir = os.path.dirname(os.path.dirname(train_dir))  # up to data_c100
+    val_dir = os.path.join(base_data_dir, "raw", "val")
+
+    train_set = datasets.ImageFolder(root=train_dir, transform=load_transforms(train=True))
+    val_set   = datasets.ImageFolder(root=val_dir, transform=load_transforms(train=False))
 
     train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True)
     val_loader   = DataLoader(val_set,   batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
@@ -46,11 +52,20 @@ class _CompatScheduler:
     def load_state_dict(self, s): return self.sched.load_state_dict(s)
 
 def define_loss_and_optimizer(model, lr, weight_decay):
-    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)  # 小幅 smoothing 提升泛化
-    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay, betas=(0.9, 0.999))
-    # 余弦退火到 0（T_max 在 main.py 里看不到 epoch，这里约个上限；实际每轮 step 一次）
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=200)
-    scheduler = _CompatScheduler(scheduler)  # 兼容 main.py 的 scheduler.step(val_loss)
+    # 使用更强的标签平滑和焦点损失
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.2)  # 增加标签平滑
+    
+    # 使用SGD优化器，通常在大数据集上表现更好
+    optimizer = optim.SGD(model.parameters(), lr=lr, weight_decay=weight_decay, 
+                         momentum=0.9, nesterov=True)
+    
+    # 使用更复杂的学习率调度策略
+    scheduler = optim.lr_scheduler.OneCycleLR(
+        optimizer, max_lr=lr*5, epochs=200, 
+        steps_per_epoch=1, pct_start=0.3,
+        anneal_strategy='cos'
+    )
+    scheduler = _CompatScheduler(scheduler)
     return criterion, optimizer, scheduler
 
 # ---- 3) 训练/验证（含 AMP + 梯度裁剪）----

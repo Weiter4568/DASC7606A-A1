@@ -18,15 +18,34 @@ class ImageAugmenter:
         self.image_extensions = image_extensions
         random.seed(seed); np.random.seed(seed)
         self.transform = A.Compose([
+            # 更强的几何变换
             A.PadIfNeeded(40, 40, border_mode=cv2.BORDER_REFLECT_101, p=1.0),
             A.RandomCrop(32, 32, p=1.0),
             A.HorizontalFlip(p=0.5),
-            A.ColorJitter(0.2,0.2,0.2,0.05, p=0.8),
-            A.ShiftScaleRotate(shift_limit=0.0625, scale_limit=0.1, rotate_limit=5,
-                               border_mode=cv2.BORDER_REFLECT_101, p=0.5),
-            A.CoarseDropout(max_holes=1, max_height=8, max_width=8,
-                            min_holes=1, min_height=4, min_width=4,
-                            fill_value=(125,123,114), p=0.25),
+            A.VerticalFlip(p=0.1),  # 添加垂直翻转
+            A.Rotate(limit=15, border_mode=cv2.BORDER_REFLECT_101, p=0.7),  # 增加旋转角度
+            A.ShiftScaleRotate(shift_limit=0.1, scale_limit=0.2, rotate_limit=10,
+                               border_mode=cv2.BORDER_REFLECT_101, p=0.7),
+            
+            # 更强的颜色变换
+            A.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.1, p=0.8),
+            A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.6),
+            A.HueSaturationValue(hue_shift_limit=20, sat_shift_limit=30, val_shift_limit=20, p=0.6),
+            
+            # 噪声和模糊
+            A.GaussNoise(var_limit=(10.0, 50.0), p=0.3),
+            A.GaussianBlur(blur_limit=(3, 7), p=0.2),
+            A.MotionBlur(blur_limit=7, p=0.2),
+            
+            # 更强的dropout
+            A.CoarseDropout(max_holes=2, max_height=12, max_width=12,
+                            min_holes=1, min_height=6, min_width=6,
+                            fill_value=(125,123,114), p=0.4),
+            A.GridDropout(ratio=0.4, p=0.2),  # 网格dropout
+            
+            # 混合增强
+            A.RandomGridShuffle(grid=(2, 2), p=0.1),
+            A.Cutout(num_holes=1, max_h_size=8, max_w_size=8, p=0.3),
         ])
 
     def _find_image_files(self, root: Path) -> List[Path]:

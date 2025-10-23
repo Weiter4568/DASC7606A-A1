@@ -90,4 +90,5 @@ class SimpleCNN(nn.Module):
         return self.fc2(x)
 
 def create_model(num_classes, device, dropout=0.3):
-    return WideResNet(depth=28, widen_factor=10, num_classes=num_classes, dropout=dropout).to(device)
+    # 使用更深的WideResNet和更高的widen factor
+    return WideResNet(depth=40, widen_factor=12, num_classes=num_classes, dropout=dropout).to(device)
