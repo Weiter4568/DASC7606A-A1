@@ -218,6 +218,7 @@ __marimo__/
 # data files
 data/*
 data_c100/*
+data_c100/*
 
 # model weights
 models/*
