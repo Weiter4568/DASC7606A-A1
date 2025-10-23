@@ -1,0 +1,13 @@
+python main.py \
+  --dataset cifar100 \
+  --data_dir data_c100 \
+  --output_dir results_c100_wrn28_10 \
+  --aug_count 2 \
+  --batch_size 128 \
+  --num_epochs 220 \
+  --lr 0.0008 \
+  --weight_decay 5e-4 \
+  --early_stopping_patience 30 \
+  --num_workers 8 \
+  --device cuda \
+  --seed 42
