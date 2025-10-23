@@ -109,9 +109,7 @@ def validate_epoch(model, dataloader, criterion, device):
     total = 0
 
     with torch.no_grad():
-        progress_bar = tqdm(dataloader, desc="Validation", leave=False)
-
-        for inputs, labels in progress_bar:
+        for inputs, labels in dataloader:
             inputs, labels = inputs.to(device), labels.to(device)
 
             # Forward pass
@@ -123,11 +121,6 @@ def validate_epoch(model, dataloader, criterion, device):
             _, predicted = outputs.max(1)
             total += labels.size(0)
             correct += predicted.eq(labels).sum().item()
-
-            # Update progress bar
-            progress_bar.set_postfix(
-                {"Loss": f"{loss.item():.4f}", "Acc": f"{100.0 * correct / total:.2f}%"}
-            )
 
     epoch_loss = running_loss / total
     epoch_acc = 100.0 * correct / total
