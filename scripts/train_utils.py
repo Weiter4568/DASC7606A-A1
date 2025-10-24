@@ -59,12 +59,16 @@ def define_loss_and_optimizer(model, lr, weight_decay):
     optimizer = optim.SGD(model.parameters(), lr=lr, weight_decay=weight_decay, 
                          momentum=0.9, nesterov=True)
     
+    # TODO: 学习率调度策略
     # 使用更复杂的学习率调度策略
-    scheduler = optim.lr_scheduler.OneCycleLR(
-        optimizer, max_lr=lr*5, epochs=200, 
-        steps_per_epoch=1, pct_start=0.3,
-        anneal_strategy='cos'
-    )
+    # scheduler = optim.lr_scheduler.OneCycleLR(
+    #     optimizer, max_lr=lr*5, epochs=200, 
+    #     steps_per_epoch=1, pct_start=0.3,
+    #     anneal_strategy='cos'
+    # )
+
+    # 分段衰减	在总Epoch数的 50% 和 75% 时，将学习率乘以0.2（即衰减为原来的1/5）。这是WRN的经典策略。
+    scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=[100, 150], gamma=0.2)
     scheduler = _CompatScheduler(scheduler)
     return criterion, optimizer, scheduler
 
