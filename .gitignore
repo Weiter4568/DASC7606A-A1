@@ -217,9 +217,15 @@ __marimo__/
 
 # data files
 data/*
+data_c100/*
 
 # model weights
 models/*
 
 # results
 results/*
+
+# --- IGNORE ---
+*.out
+*.txt
+*.pth
