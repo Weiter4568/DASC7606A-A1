@@ -77,6 +77,8 @@ def define_loss_and_optimizer(model, lr, weight_decay):
 
 # ---- 3) 训练/验证（含 AMP + 梯度裁剪）----
 def train_epoch(model, loader, criterion, optimizer, device, max_norm=1.0):
+# ---- 3) 训练/验证（含 AMP + 梯度裁剪）----
+def train_epoch(model, loader, criterion, optimizer, device, max_norm=1.0):
     model.train()
     scaler = torch.cuda.amp.GradScaler(enabled=(device=='cuda' and torch.cuda.is_available()))
     total_loss, correct, n = 0.0, 0, 0
@@ -91,7 +93,25 @@ def train_epoch(model, loader, criterion, optimizer, device, max_norm=1.0):
             scaler.unscale_(optimizer)
             nn.utils.clip_grad_norm_(model.parameters(), max_norm)
         scaler.step(optimizer); scaler.update()
+    scaler = torch.cuda.amp.GradScaler(enabled=(device=='cuda' and torch.cuda.is_available()))
+    total_loss, correct, n = 0.0, 0, 0
+    for inputs, targets in loader:
+        inputs, targets = inputs.to(device), targets.to(device)
+        optimizer.zero_grad(set_to_none=True)
+        with torch.cuda.amp.autocast(enabled=scaler.is_enabled()):
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
+        scaler.scale(loss).backward()
+        if max_norm is not None:
+            scaler.unscale_(optimizer)
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm)
+        scaler.step(optimizer); scaler.update()
 
+        total_loss += loss.item() * inputs.size(0)
+        pred = outputs.argmax(1)
+        correct += (pred == targets).sum().item()
+        n += inputs.size(0)
+    return total_loss / n, 100.0 * correct / n
         total_loss += loss.item() * inputs.size(0)
         pred = outputs.argmax(1)
         correct += (pred == targets).sum().item()
