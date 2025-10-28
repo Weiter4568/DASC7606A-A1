@@ -8,12 +8,13 @@ from torchvision import datasets, transforms
 from tqdm import tqdm
 
 
-def load_transforms(train=True):
+def load_transforms(train=False):
     mean, std = (0.5071,0.4865,0.4409), (0.2673,0.2564,0.2762)  # CIFAR-100; CIFAR-10 也可用 (0.4914,0.4822,0.4465)/(0.2023,0.1994,0.2010)
     if train:
         tf = transforms.Compose([
             transforms.RandomCrop(32, padding=4),
             transforms.RandomHorizontalFlip(),
+            transforms.RandAugment(num_ops=2, magnitude=9),
             transforms.ToTensor(),
             transforms.Normalize(mean, std),
         ])
@@ -53,7 +54,7 @@ class _CompatScheduler:
 
 def define_loss_and_optimizer(model, lr, weight_decay):
     # 使用更强的标签平滑和焦点损失
-    criterion = nn.CrossEntropyLoss(label_smoothing=0.2)  # 增加标签平滑
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)  # 增加标签平滑
     
     # 使用SGD优化器，通常在大数据集上表现更好
     optimizer = optim.SGD(model.parameters(), lr=lr, weight_decay=weight_decay, 
@@ -61,6 +62,8 @@ def define_loss_and_optimizer(model, lr, weight_decay):
     
     # TODO: 学习率调度策略
     # 使用更复杂的学习率调度策略
+
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=300, eta_min=0)
     # scheduler = optim.lr_scheduler.OneCycleLR(
     #     optimizer, max_lr=lr*5, epochs=200, 
     #     steps_per_epoch=1, pct_start=0.3,
@@ -68,7 +71,7 @@ def define_loss_and_optimizer(model, lr, weight_decay):
     # )
 
     # 分段衰减	在总Epoch数的 50% 和 75% 时，将学习率乘以0.2（即衰减为原来的1/5）。这是WRN的经典策略。
-    scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=[100, 150], gamma=0.2)
+    # scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=[100, 150], gamma=0.2)
     scheduler = _CompatScheduler(scheduler)
     return criterion, optimizer, scheduler
 

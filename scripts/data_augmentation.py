@@ -45,7 +45,7 @@ class ImageAugmenter:
             
             # 混合增强
             A.RandomGridShuffle(grid=(2, 2), p=0.1),
-            A.Cutout(num_holes=1, max_h_size=8, max_w_size=8, p=0.3),
+            # A.Cutout is not available in albumentations; replace with another dropout. Already using CoarseDropout above.
         ])
 
     def _find_image_files(self, root: Path) -> List[Path]:
