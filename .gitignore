@@ -232,3 +232,5 @@ results_c100_*/*
 
 # slum log files
 slurm-*.out
+*.out
+*.txt
