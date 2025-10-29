@@ -181,23 +181,24 @@ def train(args, model: nn.Module):
     # Load data
     train_loader, val_loader = load_data(args.data_dir + "/raw", args.batch_size)
 
-    EMA_WARMUP_EPOCHS = 10  # 前 10 个 epoch 不用 EMA 权重做验证/保存
+    EMA_WARMUP_EPOCHS = 30  # 前 30 个 epoch 不用 EMA 权重做验证/保存
 
     print("Starting training...")
-    scaler = torch.cuda.amp.GradScaler()  # 混合精度训练的 scaler
+    scaler = torch.amp.GradScaler('cuda')  # 混合精度训练的 scaler
     for epoch in range(args.num_epochs):
+
         # Train for one epoch
         train_loss, train_acc = train_epoch(
             model, train_loader, criterion, optimizer, args.device, ema=ema, scaler=scaler
         )
+        use_ema_now = (ema is not None) and (epoch + 1 >= EMA_WARMUP_EPOCHS)
 
         # 2) Validate with EMA weights (if available)
-        use_ema_now = (ema is not None) and (epoch + 1 >= EMA_WARMUP_EPOCHS)
-        if use_ema_now:
-            ema.apply_to(model)               # ⇦ 立刻应用 EMA 权重
+        # if use_ema_now:
+        #     ema.apply_to(model)               # ⇦ 立刻应用 EMA 权重
         val_loss, val_acc = validate_epoch(model, val_loader, criterion, args.device)
-        if use_ema_now:
-            ema.restore(model)                 # ⇦ 立刻恢复训练权重
+        # if use_ema_now:
+        #     ema.restore(model)                 # ⇦ 立刻恢复训练权重
 
         # Update learning rate based on validation loss
         scheduler.step()
@@ -213,17 +214,13 @@ def train(args, model: nn.Module):
         print(f"  Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%")
         print(f"  Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%")
 
-        # TODO: A/B 验证
-        if use_ema_now:
-            val_loss_without_ema, val_acc_without_ema = validate_epoch(model, val_loader, criterion, args.device)
-            print(f"    (Without EMA) Val Loss: {val_loss_without_ema:.4f}, Val Acc: {val_acc_without_ema:.2f}%")   
         
         # Check for improvement and save the best model
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             patience_counter = 0
-            if use_ema_now:
-                ema.apply_to(model)
+            # if use_ema_now:
+            #     ema.apply_to(model)
             save_checkpoint(
                 {
                     "epoch": epoch + 1,
@@ -236,9 +233,9 @@ def train(args, model: nn.Module):
                 },
                 args.output_dir + "/models/best_model.pth",
             )
-            if use_ema_now:
-                ema.restore(model)
-            print("  ↳ Validation loss improved. Saving best (EMA) model!")
+            # if use_ema_now:
+            #     ema.restore(model)
+            print("  ↳ Validation loss improved. Saving best model!")
         else:
             patience_counter += 1
             print(

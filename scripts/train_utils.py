@@ -8,13 +8,15 @@ from torchvision import datasets, transforms
 from tqdm import tqdm
 import time
 import math
+import torch.nn.functional as F
+import numpy as np
 
 class EMA:
     """
-    Exponential Moving Average of model parameters AND buffers (e.g., BN running stats).
-    - 跟踪: 仅 requires_grad 的 parameters + 所有浮点 buffers
-    - 支持: DDP(DataParallel) 的 model.module
-    - 提供: warm start (靠外部控制何时 apply_to)
+    Exponential Moving Average for both trainable parameters and floating buffers (e.g., BN running stats).
+    - 兼容 DataParallel/DDP（自动走 model.module）
+    - update() 放在 optimizer.step 之后
+    - apply_to()/restore() 同时交换 params + buffers
     """
     def __init__(self, model: nn.Module, decay: float = 0.999):
         self.decay = decay
@@ -22,29 +24,25 @@ class EMA:
         self.shadow_buffers = {}
         self.backup_params = {}
         self.backup_buffers = {}
+        self.num_updates = 0
 
         tracked = model.module if hasattr(model, "module") else model
 
-        # 1) track trainable parameters
+        # 跟踪需梯度的参数
         for n, p in tracked.named_parameters():
             if p.requires_grad:
                 self.shadow_params[n] = p.detach().clone()
 
-        # 2) track floating buffers (BN running stats, etc.)
+        # 跟踪浮点 buffers（BN running_mean/var 等）
         for n, b in tracked.named_buffers():
             if torch.is_floating_point(b):
                 self.shadow_buffers[n] = b.detach().clone()
-
-        self.num_updates = 0  # 记录更新次数（可用于 bias-correction 等）
 
     @torch.no_grad()
     def update(self, model: nn.Module):
         tracked = model.module if hasattr(model, "module") else model
         d = self.decay
         self.num_updates += 1
-
-        # 可选的 bias-corrected 动态衰减（更快贴近当前权重）
-        # d = min(self.decay, (1 + self.num_updates) / (10 + self.num_updates))
 
         for n, p in tracked.named_parameters():
             if p.requires_grad and n in self.shadow_params:
@@ -59,12 +57,14 @@ class EMA:
         tracked = model.module if hasattr(model, "module") else model
         self.backup_params = {}
         self.backup_buffers = {}
+
         # swap params
         for n, p in tracked.named_parameters():
             if p.requires_grad and n in self.shadow_params:
                 self.backup_params[n] = p.detach().clone()
                 p.data.copy_(self.shadow_params[n])
-        # swap buffers (e.g., BN running stats)
+
+        # swap buffers
         for n, b in tracked.named_buffers():
             if torch.is_floating_point(b) and n in self.shadow_buffers:
                 self.backup_buffers[n] = b.detach().clone()
@@ -73,19 +73,19 @@ class EMA:
     @torch.no_grad()
     def restore(self, model: nn.Module):
         tracked = model.module if hasattr(model, "module") else model
-        # restore params
+
         for n, p in tracked.named_parameters():
             if p.requires_grad and n in self.backup_params:
                 p.data.copy_(self.backup_params[n])
-        # restore buffers
+
         for n, b in tracked.named_buffers():
             if torch.is_floating_point(b) and n in self.backup_buffers:
                 b.data.copy_(self.backup_buffers[n])
+
         self.backup_params.clear()
         self.backup_buffers.clear()
 
     def state_dict(self):
-        # 统一保存到 CPU，防止跨设备报错
         return {
             "decay": self.decay,
             "num_updates": self.num_updates,
@@ -97,8 +97,9 @@ class EMA:
         self.decay = state.get("decay", self.decay)
         self.num_updates = state.get("num_updates", 0)
         dev = device or "cpu"
-        self.shadow_params = {k: v.to(dev) for k, v in state["shadow_params"].items()}
+        self.shadow_params  = {k: v.to(dev) for k, v in state["shadow_params"].items()}
         self.shadow_buffers = {k: v.to(dev) for k, v in state["shadow_buffers"].items()}
+
 
 
 def mixup_cutmix_collate(batch, alpha=1.0, mixup_prob=0.5, cutmix_prob=0.5, num_classes=100):
@@ -215,8 +216,30 @@ def load_data(data_dir, batch_size):
     val_dataset = datasets.ImageFolder(root=data_dir + "/val", transform=load_transforms(train=False))
 
     # Create data loaders for training and validation
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=2)
+    from scripts.train_utils import mixup_cutmix_collate  # 导入上面的函数
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=2,
+        pin_memory=True,
+        drop_last=True,
+        collate_fn=lambda b: mixup_cutmix_collate(
+            b,
+            alpha=1.0,
+            mixup_prob=0.5,
+            cutmix_prob=0.5,
+            num_classes=len(train_dataset.classes)
+        )
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=max(256, batch_size),
+        shuffle=False,
+        num_workers=2,
+        pin_memory=True
+    )
 
     # Print dataset summary
     print(f"Dataset loaded from: {data_dir}")
@@ -274,58 +297,69 @@ def define_loss_and_optimizer(model: nn.Module,
     return criterion, optimizer, scheduler, ema
 
 
+def soft_cross_entropy(logits: torch.Tensor, soft_targets: torch.Tensor) -> torch.Tensor:
+    """CE for soft/one-hot labels."""
+    return torch.mean(torch.sum(-soft_targets * F.log_softmax(logits, dim=1), dim=1))
 
 def train_epoch(model,
                 dataloader,
-                criterion,
+                criterion,             # 仍可传 CrossEntropyLoss；软标签时会自动改用 SCE
                 optimizer,
                 device,
-                ema=None,                 # 传入你的 EMA 对象（可为 None）
-                use_amp: bool = True,    # 是否使用自动混合精度
-                scaler=None,              # torch.cuda.amp.GradScaler；use_amp=True 时建议传入
-                log_interval: int = 0):   # >0 时按步数间隔打印批次日志
+                ema=None,              # EMA 对象或 None
+                use_amp: bool = True,
+                scaler=None,           # torch.amp.GradScaler；use_amp=True 时建议传入
+                log_interval: int = 0,  # >0 时按步数间隔打印批次日志
+               ):
     """
-    Train the model for one epoch (no tqdm; prints epoch time).
+    Train the model for one epoch (handles mixup/cutmix soft labels).
     Returns:
-        epoch_loss (float), epoch_acc (float), epoch_seconds (float)
+        epoch_loss (float), epoch_acc (float)
     """
+    if use_amp and scaler is None:
+        raise ValueError("use_amp=True 但未传入 GradScaler，请传入 scaler 或将 use_amp 设为 False。")
+
     model.train()
     running_loss, correct, total = 0.0, 0, 0
-
     start = time.time()
 
     for step, (inputs, labels) in enumerate(dataloader, start=1):
-        inputs, labels = inputs.to(device, non_blocking=True), labels.to(device, non_blocking=True)
+        inputs = inputs.to(device, non_blocking=True)
+
+        # --- 判定是否为软标签（来自 mixup/cutmix 的 one-hot/soft） ---
+        use_soft = isinstance(labels, torch.Tensor) and labels.ndim > 1
+        if use_soft:
+            labels_soft = labels.to(device, non_blocking=True).float()     # for loss
+            labels_hard = labels.argmax(dim=1).to(device, non_blocking=True)  # for acc
+        else:
+            labels_hard = labels.to(device, non_blocking=True)             # for acc & loss
 
         optimizer.zero_grad(set_to_none=True)
 
         if use_amp:
-            if scaler is None:
-                raise ValueError("use_amp=True 但未传入 GradScaler，请传入 scaler 或将 use_amp 设为 False。")
             with torch.amp.autocast('cuda', dtype=torch.float16):
                 outputs = model(inputs)
-                loss = criterion(outputs, labels)
+                loss = soft_cross_entropy(outputs, labels_soft) if use_soft else criterion(outputs, labels_hard)
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
         else:
             outputs = model(inputs)
-            loss = criterion(outputs, labels)
+            loss = soft_cross_entropy(outputs, labels_soft) if use_soft else criterion(outputs, labels_hard)
             loss.backward()
             optimizer.step()
 
-        # ---- EMA: 每个优化步后更新 ----
+        # ---- EMA: 前10步后更新 ----
         if ema is not None:
             ema.update(model)
 
         # ---- 统计 ----
-        batch_size = labels.size(0)
-        running_loss += loss.item() * batch_size
-        _, predicted = outputs.max(1)
-        total += batch_size
-        correct += predicted.eq(labels).sum().item()
+        bs = labels_hard.size(0)
+        running_loss += loss.item() * bs
+        preds = outputs.argmax(dim=1)
+        total += bs
+        correct += (preds == labels_hard).sum().item()
 
-        # 可选：按间隔打印批次日志
         if log_interval and (step % log_interval == 0):
             cur_acc = 100.0 * correct / max(1, total)
             print(f"[Step {step:5d}] loss={loss.item():.4f} acc={cur_acc:.2f}%")
@@ -334,10 +368,9 @@ def train_epoch(model,
     epoch_loss = running_loss / max(1, total)
     epoch_acc = 100.0 * correct / max(1, total)
 
-    # 这里直接打印每个 epoch 的用时（也可以在外层根据返回值自行打印）
     print(f"Epoch done | time: {epoch_seconds:.2f}s | loss: {epoch_loss:.4f} | acc: {epoch_acc:.2f}%")
-
     return epoch_loss, epoch_acc
+
 
 
 def validate_epoch(model, dataloader, criterion, device):
@@ -349,7 +382,7 @@ def validate_epoch(model, dataloader, criterion, device):
         criterion: Loss function
         device: torch.device
     Returns:
-        (epoch_loss, epoch_acc, epoch_seconds)
+        (epoch_loss, epoch_acc)
     """
     model.eval()
     running_loss = 0.0
@@ -361,6 +394,9 @@ def validate_epoch(model, dataloader, criterion, device):
     for inputs, labels in dataloader:
             inputs = inputs.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
+
+            if labels.ndim > 1:
+                labels = labels.argmax(dim=1)
 
             outputs = model(inputs)
             loss = criterion(outputs, labels)

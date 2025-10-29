@@ -1,0 +1,66 @@
+#!/bin/bash
+
+# ==================== SLURM 参数设置 ====================
+#SBATCH -p q-3090-batch
+#SBATCH --nodes=1
+#SBATCH --gres=gpu:rtx_3090:1
+#SBATCH -J cifar100_3090
+#SBATCH --cpus-per-task=1
+#SBATCH --mem=200G
+#SBATCH --time=15:00:00
+# ==================== 环境设置 ====================
+# 加载必要的模块（根据集群配置调整）
+# module load cuda/12.4
+# module load python/3.13
+
+# 初始化 conda
+. $HOME/miniconda3/etc/profile.d/conda.sh
+
+# 激活你的环境（修改为你的环境名）
+conda activate DL
+
+# 或者如果你使用虚拟环境
+# source $HOME/venv/bin/activate
+
+# ==================== 运行设置 ====================
+# 进入你的工作目录（修改为你的实际路径）
+cd ./DL/DASC7606A-A1
+
+# 创建必要的目录
+mkdir -p data_c100
+mkdir -p results_c100_wrn28_10
+
+# 显示环境信息
+echo "=== 环境信息 ==="
+echo "工作目录: $(pwd)"
+echo "Python 路径: $(which python)"
+echo "Python 版本: $(python --version)"
+echo "CUDA 信息:"
+nvidia-smi
+echo "开始时间: $(date)"
+
+# ==================== 运行训练 ====================
+echo "=== 开始训练 ==="
+python main.py \
+  --dataset cifar100 \
+  --data_dir data_c100 \
+  --output_dir results_c100_wrn28_10 \
+  --aug_count 3 \
+  --batch_size 256 \
+  --num_epochs 350 \
+  --lr 0.2 \
+  --weight_decay 5e-4 \
+  --early_stopping_patience 300 \
+  --num_workers 8 \
+  --device cuda \
+  --seed 42
+
+# 检查退出状态
+if [ $? -eq 0 ]; then
+    echo "=== 训练成功完成 ==="
+else
+    echo "=== 训练失败 ==="
+    exit 1
+fi
+
+echo "结束时间: $(date)"
