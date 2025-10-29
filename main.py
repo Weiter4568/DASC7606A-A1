@@ -73,17 +73,17 @@ def parse_args():
     # Training parameters
     parser.add_argument("--batch_size", type=int, default=128,
                         help="Batch size for training")
-    parser.add_argument("--num_epochs", type=int, default=30,
+    parser.add_argument("--num_epochs", type=int, default=300,
                         help="Number of training epochs")
-    parser.add_argument("--lr", type=float, default=0.001,
+    parser.add_argument("--lr", type=float, default=0.2,
                         help="Learning rate")
-    parser.add_argument("--weight_decay", type=float, default=1e-4,
+    parser.add_argument("--weight_decay", type=float, default=5e-4,
                         help="Weight decay (L2 penalty)")
 
     # Checkpointing
     parser.add_argument("--save_freq", type=int, default=1,
                         help="Save checkpoint every N epochs")
-    parser.add_argument("--early_stopping_patience", type=int, default=10,
+    parser.add_argument("--early_stopping_patience", type=int, default=30,
                         help="Early stopping patience")
 
     # Hardware
@@ -160,7 +160,7 @@ def build_model(args):
 
 def train(args, model: nn.Module):
     # Define loss and optimizer
-    criterion, optimizer, scheduler = define_loss_and_optimizer(model, args.lr, args.weight_decay)
+    criterion, optimizer, scheduler, ema = define_loss_and_optimizer(model, args.lr, args.weight_decay, epochs=args.num_epochs)
 
     # Initialize tracking variables
     best_val_loss = float("inf")
@@ -179,20 +179,28 @@ def train(args, model: nn.Module):
     print(f"Training configured for {args.num_epochs} epochs with early stopping patience of {args.early_stopping_patience}.")
 
     # Load data
-    train_loader, val_loader = load_data(args.data_dir + "/augmented/train", args.batch_size)
+    train_loader, val_loader = load_data(args.data_dir + "/raw", args.batch_size)
+
+    EMA_WARMUP_EPOCHS = 10  # 前 10 个 epoch 不用 EMA 权重做验证/保存
 
     print("Starting training...")
+    scaler = torch.cuda.amp.GradScaler()  # 混合精度训练的 scaler
     for epoch in range(args.num_epochs):
         # Train for one epoch
         train_loss, train_acc = train_epoch(
-            model, train_loader, criterion, optimizer, args.device
+            model, train_loader, criterion, optimizer, args.device, ema=ema, scaler=scaler
         )
 
-        # Validate the model
+        # 2) Validate with EMA weights (if available)
+        use_ema_now = (ema is not None) and (epoch + 1 >= EMA_WARMUP_EPOCHS)
+        if use_ema_now:
+            ema.apply_to(model)               # ⇦ 立刻应用 EMA 权重
         val_loss, val_acc = validate_epoch(model, val_loader, criterion, args.device)
+        if use_ema_now:
+            ema.restore(model)                 # ⇦ 立刻恢复训练权重
 
         # Update learning rate based on validation loss
-        scheduler.step(val_loss)
+        scheduler.step()
 
         # Store metrics for plotting
         train_losses.append(train_loss)
@@ -205,10 +213,17 @@ def train(args, model: nn.Module):
         print(f"  Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%")
         print(f"  Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%")
 
+        # TODO: A/B 验证
+        if use_ema_now:
+            val_loss_without_ema, val_acc_without_ema = validate_epoch(model, val_loader, criterion, args.device)
+            print(f"    (Without EMA) Val Loss: {val_loss_without_ema:.4f}, Val Acc: {val_acc_without_ema:.2f}%")   
+        
         # Check for improvement and save the best model
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             patience_counter = 0
+            if use_ema_now:
+                ema.apply_to(model)
             save_checkpoint(
                 {
                     "epoch": epoch + 1,
@@ -216,10 +231,14 @@ def train(args, model: nn.Module):
                     "best_val_loss": best_val_loss,
                     "optimizer": optimizer.state_dict(),
                     "scheduler": scheduler.state_dict(),
+                    # 保存 EMA 以便断点续训（可选）
+                    "ema": None if ema is None else ema.state_dict(),  # ✅ 新的保存方式
                 },
                 args.output_dir + "/models/best_model.pth",
             )
-            print("  ↳ Validation loss improved. Saving best model!")
+            if use_ema_now:
+                ema.restore(model)
+            print("  ↳ Validation loss improved. Saving best (EMA) model!")
         else:
             patience_counter += 1
             print(
@@ -253,14 +272,14 @@ def evaluate(args, model: nn.Module):
     """Evaluate the model on test data"""
     # Load the test dataset from the specified directory
     test_data_dir = args.data_dir + "/raw/test"
-    test_dataset = datasets.ImageFolder(root=test_data_dir, transform=load_transforms())
+    test_dataset = datasets.ImageFolder(root=test_data_dir, transform=load_transforms(train=False, use_randaugment=False))
     test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
 
     # Set the model to evaluation mode
     model.eval()
 
     # Define loss function
-    criterion, _, _ = define_loss_and_optimizer(model, args.lr, args.weight_decay)
+    criterion, _, _, _ = define_loss_and_optimizer(model, args.lr, args.weight_decay)
 
     # Evaluate the model
     test_loss, test_accuracy, all_preds, all_labels, all_probs = evaluate_model(
@@ -286,7 +305,7 @@ def main():
     # Collect data
     collect_data(args)
     # Augment data
-    augment_data(args)
+    # augment_data(args)
     # Build model
     model = build_model(args)
     # Train
