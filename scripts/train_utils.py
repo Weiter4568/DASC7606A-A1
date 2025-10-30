@@ -5,6 +5,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
+from torch import amp
 from tqdm import tqdm
 import time
 import math
@@ -100,6 +101,69 @@ class EMA:
         self.shadow_params  = {k: v.to(dev) for k, v in state["shadow_params"].items()}
         self.shadow_buffers = {k: v.to(dev) for k, v in state["shadow_buffers"].items()}
 
+# ---- Replace your SAM class with this wrapper (no inheritance) ----
+class SAM:
+    """
+    Sharpness-Aware Minimization wrapper (composition).
+    - Holds a base optimizer (e.g., SGD).
+    - Provides first_step/second_step for two-step update.
+    - Proxies state_dict()/load_state_dict() to base optimizer so main can save/load.
+    """
+    def __init__(self, params, base_optimizer, rho=0.05, **defaults):
+        self.rho = rho
+        # instantiate the real optimizer
+        self.base_optimizer = base_optimizer(params, **defaults)
+        self.param_groups = self.base_optimizer.param_groups
+        self.state = self.base_optimizer.state  # for compatibility
+
+    @torch.no_grad()
+    def _grad_norm(self):
+        device = self.param_groups[0]["params"][0].device
+        norms = []
+        for group in self.param_groups:
+            for p in group["params"]:
+                if p.grad is not None:
+                    norms.append(p.grad.norm(p=2).to(device))
+        return torch.norm(torch.stack(norms), p=2) if norms else torch.tensor(0., device=device)
+
+    @torch.no_grad()
+    def first_step(self, zero_grad=True):
+        scale = self._grad_norm()
+        for group in self.param_groups:
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                e_w = p.grad * (self.rho / (scale + 1e-12))
+                p.add_(e_w)
+                self.state[p]["e_w"] = e_w
+        if zero_grad:
+            self.base_optimizer.zero_grad(set_to_none=True)
+
+    @torch.no_grad()
+    def second_step(self, zero_grad=True):
+        for group in self.param_groups:
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                p.sub_(self.state[p]["e_w"])
+        self.base_optimizer.step()
+        if zero_grad:
+            self.base_optimizer.zero_grad(set_to_none=True)
+
+    # ---- passthrough helpers so main/scheduler work as usual ----
+    def zero_grad(self):
+        self.base_optimizer.zero_grad(set_to_none=True)
+
+    # DO NOT expose step(); we use first_step/second_step
+    def step(self, *args, **kwargs):
+        raise NotImplementedError("Use first_step/second_step with SAM.")
+
+    # crucial: allow checkpointing
+    def state_dict(self):
+        return self.base_optimizer.state_dict()
+
+    def load_state_dict(self, state_dict):
+        self.base_optimizer.load_state_dict(state_dict)
 
 
 def mixup_cutmix_collate(batch, alpha=1.0, mixup_prob=0.5, cutmix_prob=0.5, num_classes=100):
@@ -171,14 +235,17 @@ def load_transforms(train: bool = False,
             transforms.RandomHorizontalFlip(),                # 随机水平翻转
             transforms.ColorJitter(0.2, 0.2, 0.2, 0.2),       # 轻微颜色扰动
         ]
-        # 可选的更强随机增强
+        # 可选的更强随机增强（优先使用 torchvision.transforms.RandAugment；退而用 AutoAugment）
         if use_randaugment:
             try:
-                from transforms import RandAugment
+                from torchvision.transforms import RandAugment
                 transform_list.append(RandAugment(num_ops=3, magnitude=10))
-                transform_list.append(transforms.RandomErasing(p=0.25, scale=(0.02, 0.2), ratio=(0.3, 3.3), value='random'))
             except Exception:
-                pass  # torchvision 旧版本可忽略
+                try:
+                    from torchvision.transforms import AutoAugment, AutoAugmentPolicy
+                    transform_list.append(AutoAugment(AutoAugmentPolicy.CIFAR10))
+                except Exception:
+                    pass
 
         # 基本归一化
         transform_list += [
@@ -186,6 +253,9 @@ def load_transforms(train: bool = False,
             transforms.Normalize((0.5071, 0.4867, 0.4408),
                                  (0.2675, 0.2565, 0.2761))
         ]
+        # RandomErasing 需在张量域执行，放在 Normalize 之后
+        if use_randaugment:
+            transform_list.append(transforms.RandomErasing(p=0.25, scale=(0.02, 0.2), ratio=(0.3, 3.3), value='random'))
         return transforms.Compose(transform_list)
     else:
         # 验证/测试集使用确定性变换
@@ -196,7 +266,7 @@ def load_transforms(train: bool = False,
                                  (0.2675, 0.2565, 0.2761))
         ])
 
-def load_data(data_dir, batch_size):
+def load_data(data_dir, batch_size, num_workers: int = 8, mixup_alpha: float = 0.8, mixup_prob: float = 1.0, cutmix_prob: float = 0.0):
     """
     Load the data from the data directory and split it into training and validation sets
     This function is similar to the cell 2. Data Preparation in 04_model_training.ipynb
@@ -222,14 +292,14 @@ def load_data(data_dir, batch_size):
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=2,
+        num_workers=num_workers,
         pin_memory=True,
         drop_last=True,
         collate_fn=lambda b: mixup_cutmix_collate(
             b,
-            alpha=1.0,
-            mixup_prob=0.5,
-            cutmix_prob=0.5,
+            alpha=mixup_alpha,
+            mixup_prob=mixup_prob,
+            cutmix_prob=cutmix_prob,
             num_classes=len(train_dataset.classes)
         )
     )
@@ -237,7 +307,7 @@ def load_data(data_dir, batch_size):
         val_dataset,
         batch_size=max(256, batch_size),
         shuffle=False,
-        num_workers=2,
+        num_workers=num_workers,
         pin_memory=True
     )
 
@@ -257,67 +327,62 @@ def define_loss_and_optimizer(model: nn.Module,
                               optimizer_type: str = "sgd",
                               label_smoothing: float = 0.1,
                               epochs: int = 300,
-                              warmup: int = 5,
-                              ema_decay: float = 0.999):
-    """
-    返回：criterion, optimizer, scheduler, ema
-    - SGD + Nesterov（推荐 WRN）或 AdamW/Adam
-    - Warmup + Cosine LR
-    - CrossEntropy + Label Smoothing
-    - EMA 初始化（默认 0.999）
-    """
-    # 1) Loss
+                              warmup: int = 5):
+    # Loss：配合 Mixup/CutMix 建议开 LS
     criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
 
-    # 2) Optimizer
-    opt_type = optimizer_type.lower()
-    if opt_type == "sgd":
-        optimizer = optim.SGD(model.parameters(), lr=lr, momentum=0.9,
-                              nesterov=True, weight_decay=weight_decay)
-    elif opt_type == "adamw":
-        optimizer = optim.AdamW(model.parameters(), lr=lr,
-                                weight_decay=weight_decay, betas=(0.9, 0.999))
-    elif opt_type == "adam":
-        optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
-    else:
-        raise ValueError(f"Unsupported optimizer type: {optimizer_type}")
+    # param groups：BN/bias 不做 weight decay（稳增益）
+    decay, no_decay = [], []
+    for n, p in model.named_parameters():
+        if not p.requires_grad: continue
+        if p.dim() > 1 and "bn" not in n.lower() and not n.endswith("bias"):
+            decay.append(p)
+        else:
+            no_decay.append(p)
 
-    # 3) Scheduler: warmup + cosine
+    # 基础优化器（被 SAM 包裹）
+    def _sgd(params, **kw):
+        return optim.SGD(params, lr=lr, momentum=0.9, nesterov=True, **kw)
+
+    optimizer = SAM(
+        [{"params": decay, "weight_decay": weight_decay},
+         {"params": no_decay, "weight_decay": 0.0}],
+        base_optimizer=_sgd,
+        rho=0.05   # 关键超参：推荐 0.05（可在 0.03~0.1 微调）
+    )
+
+    # Warmup + Cosine（绑定 base_optimizer）
     def lr_lambda(epoch):
         if epoch < warmup:
             return (epoch + 1) / max(1, warmup)
         t = (epoch - warmup) / max(1, epochs - warmup)
         return 0.5 * (1 + math.cos(math.pi * t))
+    scheduler = optim.lr_scheduler.LambdaLR(optimizer.base_optimizer, lr_lambda=lr_lambda)
 
-    scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
-
-    # 4) EMA
-    ema = EMA(model, decay=ema_decay)
-
-    return criterion, optimizer, scheduler, ema
+    return criterion, optimizer, scheduler
 
 
 def soft_cross_entropy(logits: torch.Tensor, soft_targets: torch.Tensor) -> torch.Tensor:
-    """CE for soft/one-hot labels."""
     return torch.mean(torch.sum(-soft_targets * F.log_softmax(logits, dim=1), dim=1))
 
 def train_epoch(model,
                 dataloader,
-                criterion,             # 仍可传 CrossEntropyLoss；软标签时会自动改用 SCE
+                criterion,
                 optimizer,
                 device,
-                ema=None,              # EMA 对象或 None
                 use_amp: bool = True,
-                scaler=None,           # torch.amp.GradScaler；use_amp=True 时建议传入
-                log_interval: int = 0,  # >0 时按步数间隔打印批次日志
-               ):
+                scaler=None,           # 从 main 传进来的 GradScaler
+                log_interval: int = 0):
     """
-    Train the model for one epoch (handles mixup/cutmix soft labels).
-    Returns:
-        epoch_loss (float), epoch_acc (float)
+    Train one epoch. 支持：
+      - Mixup/CutMix 软标签
+      - AMP (torch.amp.autocast) + 外部传入的 scaler
+      - SAM 两步更新
+      - EMA（每步更新）
+    返回: (epoch_loss, epoch_acc)
     """
     if use_amp and scaler is None:
-        raise ValueError("use_amp=True 但未传入 GradScaler，请传入 scaler 或将 use_amp 设为 False。")
+        raise ValueError("use_amp=True 但未传入 GradScaler，请从 main 传入 scaler 或将 use_amp=False。")
 
     model.train()
     running_loss, correct, total = 0.0, 0, 0
@@ -326,48 +391,89 @@ def train_epoch(model,
     for step, (inputs, labels) in enumerate(dataloader, start=1):
         inputs = inputs.to(device, non_blocking=True)
 
-        # --- 判定是否为软标签（来自 mixup/cutmix 的 one-hot/soft） ---
+        # 判定是否为软标签（来自 mixup/cutmix 的 one-hot/soft）
         use_soft = isinstance(labels, torch.Tensor) and labels.ndim > 1
         if use_soft:
-            labels_soft = labels.to(device, non_blocking=True).float()     # for loss
-            labels_hard = labels.argmax(dim=1).to(device, non_blocking=True)  # for acc
+            labels_soft = labels.to(device, non_blocking=True).float()          # for loss
+            labels_hard = labels.argmax(dim=1).to(device, non_blocking=True)    # for acc
         else:
-            labels_hard = labels.to(device, non_blocking=True)             # for acc & loss
+            labels_hard = labels.to(device, non_blocking=True)                  # for acc & loss
 
-        optimizer.zero_grad(set_to_none=True)
+        optimizer.zero_grad()
 
-        if use_amp:
-            with torch.amp.autocast('cuda', dtype=torch.float16):
+        # ===== SAM 分支 =====
+        if hasattr(optimizer, "first_step") and hasattr(optimizer, "second_step"):
+            if use_amp:
+                # 第一次前向/反向（不 unscale_）
+                with torch.amp.autocast('cuda', dtype=torch.float16):
+                    out1 = model(inputs)
+                    loss1 = soft_cross_entropy(out1, labels_soft) if use_soft else criterion(out1, labels_hard)
+                scaler.scale(loss1).backward()
+                optimizer.first_step(zero_grad=True)
+
+                # 第二次前向/反向（在 second_step 前 unscale_ 一次）
+                with torch.amp.autocast('cuda', dtype=torch.float16):
+                    out2 = model(inputs)
+                    loss2 = soft_cross_entropy(out2, labels_soft) if use_soft else criterion(out2, labels_hard)
+                scaler.scale(loss2).backward()
+                scaler.unscale_(optimizer.base_optimizer)
+                # (如需梯度裁剪，请在此处执行 clip)
+                optimizer.second_step(zero_grad=True)
+                scaler.update()
+
+                outputs_for_metrics = out2
+                loss_for_metrics = loss2
+            else:
+                out1 = model(inputs)
+                loss1 = soft_cross_entropy(out1, labels_soft) if use_soft else criterion(out1, labels_hard)
+                loss1.backward()
+                optimizer.first_step(zero_grad=True)
+
+                out2 = model(inputs)
+                loss2 = soft_cross_entropy(out2, labels_soft) if use_soft else criterion(out2, labels_hard)
+                loss2.backward()
+                optimizer.second_step(zero_grad=True)
+
+                outputs_for_metrics = out2
+                loss_for_metrics = loss2
+
+        # ===== 普通优化器分支 =====
+        else:
+            if use_amp:
+                with torch.amp.autocast('cuda', dtype=torch.float16):
+                    outputs = model(inputs)
+                    loss = soft_cross_entropy(outputs, labels_soft) if use_soft else criterion(outputs, labels_hard)
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+
+                outputs_for_metrics = outputs
+                loss_for_metrics = loss
+            else:
                 outputs = model(inputs)
                 loss = soft_cross_entropy(outputs, labels_soft) if use_soft else criterion(outputs, labels_hard)
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            outputs = model(inputs)
-            loss = soft_cross_entropy(outputs, labels_soft) if use_soft else criterion(outputs, labels_hard)
-            loss.backward()
-            optimizer.step()
+                loss.backward()
+                optimizer.step()
 
-        # ---- EMA: 前10步后更新 ----
-        if ema is not None:
-            ema.update(model)
+                outputs_for_metrics = outputs
+                loss_for_metrics = loss
 
-        # ---- 统计 ----
+
+
+        # 统计
         bs = labels_hard.size(0)
-        running_loss += loss.item() * bs
-        preds = outputs.argmax(dim=1)
+        running_loss += float(loss_for_metrics.item()) * bs
+        preds = outputs_for_metrics.argmax(dim=1)
         total += bs
         correct += (preds == labels_hard).sum().item()
 
         if log_interval and (step % log_interval == 0):
             cur_acc = 100.0 * correct / max(1, total)
-            print(f"[Step {step:5d}] loss={loss.item():.4f} acc={cur_acc:.2f}%")
+            print(f"[Step {step:5d}] loss={loss_for_metrics.item():.4f} acc={cur_acc:.2f}%")
 
     epoch_seconds = time.time() - start
     epoch_loss = running_loss / max(1, total)
     epoch_acc = 100.0 * correct / max(1, total)
-
     print(f"Epoch done | time: {epoch_seconds:.2f}s | loss: {epoch_loss:.4f} | acc: {epoch_acc:.2f}%")
     return epoch_loss, epoch_acc
 

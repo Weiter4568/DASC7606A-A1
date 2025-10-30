@@ -160,7 +160,7 @@ def build_model(args):
 
 def train(args, model: nn.Module):
     # Define loss and optimizer
-    criterion, optimizer, scheduler, ema = define_loss_and_optimizer(model, args.lr, args.weight_decay, epochs=args.num_epochs)
+    criterion, optimizer, scheduler = define_loss_and_optimizer(model, args.lr, args.weight_decay, epochs=args.num_epochs)
 
     # Initialize tracking variables
     best_val_loss = float("inf")
@@ -181,17 +181,16 @@ def train(args, model: nn.Module):
     # Load data
     train_loader, val_loader = load_data(args.data_dir + "/raw", args.batch_size)
 
-    EMA_WARMUP_EPOCHS = 30  # 前 30 个 epoch 不用 EMA 权重做验证/保存
+    from torch import amp
+    scaler = amp.GradScaler(enabled=torch.cuda.is_available())
 
     print("Starting training...")
-    scaler = torch.amp.GradScaler('cuda')  # 混合精度训练的 scaler
     for epoch in range(args.num_epochs):
 
         # Train for one epoch
         train_loss, train_acc = train_epoch(
-            model, train_loader, criterion, optimizer, args.device, ema=ema, scaler=scaler
+            model, train_loader, criterion, optimizer, args.device, scaler=scaler
         )
-        use_ema_now = (ema is not None) and (epoch + 1 >= EMA_WARMUP_EPOCHS)
 
         # 2) Validate with EMA weights (if available)
         # if use_ema_now:
@@ -228,13 +227,10 @@ def train(args, model: nn.Module):
                     "best_val_loss": best_val_loss,
                     "optimizer": optimizer.state_dict(),
                     "scheduler": scheduler.state_dict(),
-                    # 保存 EMA 以便断点续训（可选）
-                    "ema": None if ema is None else ema.state_dict(),  # ✅ 新的保存方式
                 },
                 args.output_dir + "/models/best_model.pth",
             )
-            # if use_ema_now:
-            #     ema.restore(model)
+
             print("  ↳ Validation loss improved. Saving best model!")
         else:
             patience_counter += 1
@@ -276,7 +272,7 @@ def evaluate(args, model: nn.Module):
     model.eval()
 
     # Define loss function
-    criterion, _, _, _ = define_loss_and_optimizer(model, args.lr, args.weight_decay)
+    criterion, _, _ = define_loss_and_optimizer(model, args.lr, args.weight_decay)
 
     # Evaluate the model
     test_loss, test_accuracy, all_preds, all_labels, all_probs = evaluate_model(
